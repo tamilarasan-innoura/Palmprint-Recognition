@@ -4,7 +4,7 @@ Palmprint Enrollment & Identification
 Two features on one shared engine (palm_core.py):
 
   Enrollment      Register a person with their details, from an uploaded palm
-                  image or an auto-detected webcam capture. BOTH palms are
+                  image or a webcam snapshot. BOTH palms are
                   required -- a person becomes login-ready only once their left
                   and right palms are on file.
   Identification  Submit either palm, compare it against every login-ready
@@ -14,7 +14,6 @@ Camera orientation (upside-down / mirrored laptop webcams) is a saved setting
 applied to every frame before detection, configurable on the Camera tab.
 """
 import os
-import time
 
 import cv2
 import numpy as np
@@ -77,61 +76,12 @@ def open_camera(index):
     return cap
 
 
-def capture_live_palm(seconds=20, stability_frames=6):
-    """Open the webcam and auto-capture once a palm is stably detected.
-
-    Every frame passes through the saved orientation correction first, so what
-    is previewed is exactly what gets encoded. Returns (bgr_frame, message).
-    """
-    cap = open_camera(camera["index"])
-    if not cap.isOpened():
-        cap.release()
-        return None, "Could not open the webcam (index %s)." % camera["index"]
-
-    preview, status = st.empty(), st.empty()
-    progress = st.progress(0.0)
-    stable, captured = 0, None
-    message = "Timed out before a palm was detected."
-    deadline = time.time() + seconds
-
-    try:
-        while time.time() < deadline:
-            ok, frame = cap.read()
-            if not ok:
-                message = "Webcam stopped delivering frames."
-                break
-            frame = pc.apply_orientation(frame, camera)
-            detected, msg, _, _, hand = pc.detect_palm(frame, mirrored=camera["mirror"])
-
-            stable = stable + 1 if detected else 0
-            colour = (16, 185, 129) if detected else (239, 68, 68)
-            shown = frame.copy()
-            cv2.rectangle(shown, (6, 6), (shown.shape[1] - 6, shown.shape[0] - 6),
-                          colour[::-1], 3)
-            cv2.putText(shown, msg, (16, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                        colour[::-1], 2)
-            preview.image(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB),
-                          channels="RGB", use_container_width=True)
-            status.caption("Hold steady: %d/%d stable frames" % (stable, stability_frames))
-            progress.progress(min(stable / stability_frames, 1.0))
-
-            if stable >= stability_frames:
-                captured = frame
-                message = "Captured automatically (%s)." % hand
-                break
-    finally:
-        cap.release()
-
-    preview.empty(), status.empty(), progress.empty()
-    return captured, message
-
-
 def read_source(key_prefix, help_upload):
-    """Renders the Upload / Webcam snapshot / Live auto-detect selector.
+    """Renders the Upload / Webcam snapshot selector.
 
     Returns a BGR frame, or None when nothing has been supplied yet.
     """
-    mode = st.radio("Palm input", ["Upload image", "Webcam snapshot", "Live auto-detect"],
+    mode = st.radio("Palm input", ["Upload image", "Webcam snapshot"],
                     horizontal=True, key=key_prefix + "_mode")
 
     if mode == "Upload image":
@@ -140,7 +90,7 @@ def read_source(key_prefix, help_upload):
         if up is not None:
             return pc.decode_image(up.read())
 
-    elif mode == "Webcam snapshot":
+    else:
         st.caption("Allow camera access, place your open palm in frame, then take the "
                    "photo. The saved rotation is applied to the snapshot.")
         shot = st.camera_input("Take a palm photo", key=key_prefix + "_cam")
@@ -151,21 +101,6 @@ def read_source(key_prefix, help_upload):
             # is not baked into the returned image.
             return pc.apply_orientation(frame, {"rotation": camera["rotation"],
                                                 "mirror": False})
-
-    else:
-        st.caption("Opens the laptop webcam and captures by itself once your palm "
-                   "is detected and held steady.")
-        c1, c2 = st.columns([1, 2])
-        stab = c1.number_input("Stable frames", 2, 20, 6, key=key_prefix + "_stab")
-        if c2.button("Start auto-detect", key=key_prefix + "_start",
-                     use_container_width=True):
-            frame, msg = capture_live_palm(stability_frames=int(stab))
-            if frame is None:
-                st.error(msg)
-            else:
-                st.success(msg)
-                st.session_state[key_prefix + "_frame"] = frame
-        return st.session_state.get(key_prefix + "_frame")
 
     return None
 
@@ -291,8 +226,8 @@ with tab_enroll:
 
     with right:
         if bgr is None:
-            st.info("Supply a palm image to begin — upload a file, take a webcam "
-                    "snapshot, or run live auto-detect.")
+            st.info("Supply a palm image to begin — upload a file or take a "
+                    "webcam snapshot.")
         else:
             emb, roi_norm, roi_rgb, detected_hand, source, msg = make_embedding(bgr)
             if emb is None:
@@ -363,7 +298,6 @@ with tab_enroll:
                             "gallery_name": gallery_name, "wanted_gallery": add_gallery,
                             "missing": status["missing_hands"],
                         }
-                        st.session_state.pop("en_frame", None)
                         st.rerun()
 
     st.divider()
