@@ -328,18 +328,23 @@ with tab_enroll:
 with tab_identify:
     st.subheader("Authenticate / identify a palm")
 
+    # 1:N is the default: for attendance the person just presents a palm and the
+    # system works out who they are. 1:1 answers a different question ("is this
+    # palm the person it claims to be?") and requires the name up front.
     mode_1to1 = st.radio(
-        "Mode", ["Authenticate (1:1) — claim an identity, verify the palm",
-                 "Identify (1:N) — search the whole database"],
+        "Mode", ["Identify (1:N) — show a palm, the system works out who it is"
+                 "  ·  use this for attendance",
+                 "Authenticate (1:1) — verify a palm against ONE named person"],
         key="id_mode_kind").startswith("Authenticate")
 
     if mode_1to1:
-        st.caption("The palm is compared **only** against the claimed person's own "
-                   "templates. No other enrolled identity takes part, so nobody can "
-                   "be returned in place of someone else.")
+        st.caption("Pick the person first; the palm is then checked against that "
+                   "person's templates. The verdict can only be GRANTED as them, or "
+                   "DENIED — no one else's name can be returned.")
     else:
-        st.caption("Present either palm. It is compared against every login-ready "
-                   "person and scored against all of their stored samples.")
+        st.caption("Present either palm. It is scored against every login-ready "
+                   "person and the best match is returned — which is how the system "
+                   "can tell who is clocking in without anyone typing a name.")
 
     if not persons:
         st.warning("No one is enrolled yet. Add a person on the **Enrollment** tab first.")
@@ -353,8 +358,17 @@ with tab_identify:
 
     claimed = None
     if mode_1to1 and ready:
-        claimed = st.selectbox("Who are you? (claimed identity)",
-                               [p["name"] for p in ready], key="id_claim")
+        # No pre-selected name. A default here silently verifies everyone against
+        # whoever happens to be first in the list, which is exactly how Tamil's
+        # and Bharani's palms ended up being checked against Narasimma.
+        PICK = "— select your name —"
+        chosen = st.selectbox("Who are you? (claimed identity)",
+                              [PICK] + [p["name"] for p in ready], index=0,
+                              key="id_claim")
+        claimed = None if chosen == PICK else chosen
+        if claimed is None:
+            st.info("Choose your name above, or switch to **Identify (1:N)** to let "
+                    "the system work out who you are.")
 
     also_dataset = st.checkbox("Also search the unlabeled dataset gallery", value=False,
                                help="Shows nearest neighbours among the dataset images. "
@@ -383,7 +397,9 @@ with tab_identify:
                 # ---------- 1:1 AUTHENTICATION ----------
                 if mode_1to1:
                     if not claimed:
-                        st.warning("Nobody is login-ready to authenticate against.")
+                        st.warning("No name selected, so there is nothing to verify "
+                                   "against. Pick your name above, or use "
+                                   "**Identify (1:N)** instead.")
                         st.stop()
                     result = pc.verify(emb_q, people, claimed, threshold,
                                        min_margin=min_margin)
