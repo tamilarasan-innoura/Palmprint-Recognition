@@ -27,19 +27,21 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-ENCODER_PATH = 'output/model/palmprint_encoder.pth'
-PREPROCESSED_DATA_DIR = 'dataset/preprocessed_images'  # Path to preprocessed images
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENCODER_PATH = os.path.join(BASE_DIR, 'output', 'model', 'palmprint_encoder.pth')
+PREPROCESSED_DATA_DIR = os.path.join(BASE_DIR, 'dataset', 'preprocessed_images')  # Path to preprocessed images
 
 # Initialize preprocessor (adjust parameters if needed)
-encoder = PalmprintEncoder().encoder
-encoder.load_state_dict(torch.load(ENCODER_PATH))
-encoder.eval()  # Set to evaluation mode
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')  # use GPU if available
+encoder = PalmprintEncoder().encoder
+encoder.load_state_dict(torch.load(ENCODER_PATH, map_location=device))
+encoder.eval()  # Set to evaluation mode
 encoder.to(device)
 
-all_embeddings = np.load('output/embeddings/all_embeddings.npy')
-image_names = np.load(
-    'output/embeddings/image_names.npy').tolist()  # Load as list to avoid numpy string array truncation issues
+emb_path = os.path.join(BASE_DIR, 'output', 'embeddings', 'all_embeddings.npy')
+names_path = os.path.join(BASE_DIR, 'output', 'embeddings', 'image_names.npy')
+all_embeddings = np.load(emb_path) if os.path.exists(emb_path) else np.array([])
+image_names = np.load(names_path).tolist() if os.path.exists(names_path) else []
 
 # --- Streamlit App ---
 st.title("Palmprint Recognition")
@@ -99,12 +101,13 @@ if uploaded_file is not None:
                         row_images = best_matches[i:i + images_per_row]
                         columns = st.columns(3)
                         for col, (image_name, score) in zip(columns, row_images):
-                            image_path = os.path.join(PREPROCESSED_DATA_DIR, image_name.replace('.npy',
-                                                                                                '') + ".npy")  # Find path to preprocessed image
-                            matched_image = np.load(image_path)
-
+                            image_path = os.path.join(PREPROCESSED_DATA_DIR, image_name.replace('.npy', '') + ".npy")
                             with col:
-                                st.image(matched_image, use_container_width=True)
+                                if os.path.exists(image_path):
+                                    matched_image = np.load(image_path)
+                                    st.image(matched_image, use_container_width=True)
+                                else:
+                                    st.info("🖼️ Sample match")
                                 st.markdown(
                                     f"<div style='color: green; font-weight: bold;'>Score: {score * 100:.2f}%</div>",
                                     unsafe_allow_html=True)

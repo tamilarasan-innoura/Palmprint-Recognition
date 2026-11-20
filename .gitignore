@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments (venv/ here is ~2.1 GB)
+venv/
+.venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Biometric data of real people -- deliberately NOT published.
+# Enrolled palm images and their templates identify living individuals. They
+# are regenerated locally the moment someone enrolls, so there is no reason to
+# ship them in a public repository.
+# ---------------------------------------------------------------------------
+data/
+dataset/preprocessed_images/enrolled_*
+output/audit_logs.json
+output/attendance_db.pkl
+output/attendance_report.csv
+output/attendance_timeline.json
+
+# Local runtime state
+.streamlit/secrets.toml
+*.log
+
+# Datasets downloaded at runtime
+dataset/archive/
