@@ -29,6 +29,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENCODER_PATH = os.path.join(BASE_DIR, 'output', 'model', 'palmprint_encoder.pth')
 DB_PATH = os.path.join(BASE_DIR, 'data', 'palm_users.db')
 ROI_DIR = os.path.join(BASE_DIR, 'data', 'enrolled_rois')
+# The full frame each enrolment came from. Keeping it means a change to the
+# extraction geometry can be applied by rebuilding templates, instead of asking
+# everybody to enrol again -- which this project has already had to do twice.
+RAW_DIR = os.path.join(BASE_DIR, 'data', 'enrolled_frames')
 GALLERY_DIR = os.path.join(BASE_DIR, 'dataset', 'preprocessed_images')
 EMB_PATH = os.path.join(BASE_DIR, 'output', 'embeddings', 'all_embeddings.npy')
 NAMES_PATH = os.path.join(BASE_DIR, 'output', 'embeddings', 'image_names.npy')
@@ -551,6 +555,7 @@ def init_db(encoder=None, device=None):
         hand       TEXT,
         source     TEXT,
         roi_path   TEXT,
+        raw_path   TEXT,
         embedding  BLOB NOT NULL,
         dim        INTEGER NOT NULL,
         created_at TEXT NOT NULL
@@ -566,6 +571,13 @@ def init_db(encoder=None, device=None):
     );
     CREATE INDEX IF NOT EXISTS idx_samples_person ON samples(person_id);
     """)
+
+    # CREATE TABLE IF NOT EXISTS leaves an existing table alone, so columns
+    # added later have to be migrated in explicitly.
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(samples)")}
+    if "raw_path" not in existing:
+        conn.execute("ALTER TABLE samples ADD COLUMN raw_path TEXT")
+        notes.append("added samples.raw_path (original frames kept from now on)")
 
     # Migrate the legacy single-sample `users` table, if present.
     legacy = conn.execute(
@@ -645,7 +657,7 @@ def upsert_person(details):
 
 
 def add_sample(person_id, name, embedding, roi_norm, roi_rgb, hand, source,
-               append_to_gallery=True):
+               append_to_gallery=True, raw_bgr=None):
     """Stores one palm sample.
 
     ROI image goes to disk, embedding into SQLite, and (optionally) the ROI is
@@ -658,11 +670,19 @@ def add_sample(person_id, name, embedding, roi_norm, roi_rgb, hand, source,
     roi_path = os.path.join(ROI_DIR, slug + "_" + stamp + ".png")
     cv2.imwrite(roi_path, cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR))
 
+    # Keep the untouched frame so templates can be rebuilt if the extraction
+    # geometry ever changes again.
+    raw_path = None
+    if raw_bgr is not None:
+        os.makedirs(RAW_DIR, exist_ok=True)
+        raw_path = os.path.join(RAW_DIR, slug + "_" + stamp + ".png")
+        cv2.imwrite(raw_path, raw_bgr)
+
     conn = connect()
     conn.execute(
-        "INSERT INTO samples (person_id, hand, source, roi_path, embedding, dim, created_at)"
-        " VALUES (?,?,?,?,?,?,?)",
-        (person_id, hand, source, roi_path,
+        "INSERT INTO samples (person_id, hand, source, roi_path, raw_path,"
+        " embedding, dim, created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (person_id, hand, source, roi_path, raw_path,
          embedding.astype(np.float32).tobytes(), len(embedding),
          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
     conn.commit()
@@ -800,16 +820,25 @@ def reencode_samples(encoder, device, name=None):
     conn = connect()
     if name:
         rows = conn.execute("""
-            SELECT s.id, s.roi_path, s.source FROM samples s
+            SELECT s.id, s.roi_path, s.raw_path, s.source FROM samples s
             JOIN persons p ON p.id = s.person_id WHERE p.name = ?""", (name,)).fetchall()
     else:
-        rows = conn.execute("SELECT id, roi_path, source FROM samples").fetchall()
+        rows = conn.execute(
+            "SELECT id, roi_path, raw_path, source FROM samples").fetchall()
 
     updated, skipped = 0, []
     for r in rows:
-        path = r["roi_path"]
+        # Prefer the original frame: re-cropping an already-cropped ROI cannot
+        # recover palm outside it, and only pads the image, which corrupts the
+        # template rather than rebuilding it.
+        path = r["raw_path"] if (r["raw_path"] and os.path.exists(r["raw_path"])) \
+            else r["roi_path"]
         if not path or not os.path.exists(path):
-            skipped.append((r["id"], "ROI image missing"))
+            skipped.append((r["id"], "no stored image to rebuild from"))
+            continue
+        if not r["raw_path"]:
+            skipped.append((r["id"], "only a cropped ROI is stored, not the "
+                                     "original frame - re-enrol this palm"))
             continue
         bgr = cv2.imread(path)
         if bgr is None:

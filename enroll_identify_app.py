@@ -285,7 +285,8 @@ with tab_enroll:
                         pid = pc.upsert_person(details)
                         roi_path, gallery_name = pc.add_sample(
                             pid, details["name"], emb, roi_norm, roi_rgb,
-                            hand_choice, source, append_to_gallery=add_gallery)
+                            hand_choice, source, append_to_gallery=add_gallery,
+                            raw_bgr=bgr)
 
                         hands_now = [s["hand"] for s in pc.person_samples(details["name"])]
                         status = pc.enrollment_status(hands_now)
