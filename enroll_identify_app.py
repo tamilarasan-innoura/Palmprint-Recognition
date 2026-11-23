@@ -393,6 +393,32 @@ with tab_identify:
                 st.caption("Auto-detected: **%s** · extraction: **%s**"
                            % (hand_q, source_q))
 
+                # Draw the creases the matcher actually keys on, so a result can
+                # be inspected rather than taken on trust.
+                overlay, creases, lines = pc.detect_palm_lines(roi_rgb_q)
+                if overlay is not None:
+                    st.markdown("**Palm lines detected**")
+                    lc1, lc2 = st.columns(2)
+                    lc1.image(overlay, caption="Lines found on your palm",
+                              use_container_width=True)
+                    lc2.image(creases, caption="Crease map (what the matcher sees)",
+                              use_container_width=True)
+                    if lines:
+                        st.caption("%d crease line(s); the %d longest are coloured "
+                                   "red, green, yellow."
+                                   % (len(lines), min(3, len(lines))))
+                        st.dataframe(pd.DataFrame([{
+                            "Line": "#%d" % (i + 1),
+                            "Length (px)": "%.0f" % l["length"],
+                            "Thickness (px²)": l["area"],
+                        } for i, l in enumerate(lines[:5])]),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.warning("No clear palm lines were found. This capture "
+                                   "carries little crease detail, so any match is "
+                                   "unreliable — improve the lighting and hold the "
+                                   "palm flat and steady.")
+
             with rcol:
                 # ---------- 1:1 AUTHENTICATION ----------
                 if mode_1to1:

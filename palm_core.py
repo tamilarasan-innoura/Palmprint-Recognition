@@ -297,6 +297,88 @@ def detect_palm(bgr, mirrored=True):
     return True, hand + " detected (palm registered)", roi_norm, roi_rgb, hand
 
 
+# ===================== PALM LINE VISUALISATION =====================
+# Minimum black-hat response for a pixel to count as crease rather than noise.
+MIN_CREASE_RESPONSE = 8
+# Distinct colours for the principal lines, longest first (RGB).
+PRINCIPAL_LINE_COLOURS = [(239, 68, 68), (52, 211, 153), (250, 204, 21),
+                          (96, 165, 250), (232, 121, 249)]
+
+
+def detect_palm_lines(palm_rgb, max_principal=3, min_length=40):
+    """Find the crease pattern in a palm ROI and draw it.
+
+    Returns (overlay_rgb, creases_rgb, lines). `lines` is a list of dicts with
+    'length' and 'mask', longest first. This is a visualisation of the texture
+    the matcher relies on -- if nothing is drawn, the capture carries no usable
+    crease detail and will not match well.
+    """
+    if palm_rgb is None or palm_rgb.size == 0:
+        return None, None, []
+
+    work = cv2.resize(palm_rgb, PALM_STORE_SIZE, interpolation=cv2.INTER_AREA) \
+        if palm_rgb.shape[:2] != PALM_STORE_SIZE else palm_rgb.copy()
+    gray = cv2.cvtColor(work, cv2.COLOR_RGB2GRAY)
+
+    # Flatten illumination so shading gradients are not mistaken for lines.
+    background = cv2.GaussianBlur(gray, (0, 0), sigmaX=work.shape[0] / 8.0)
+    flat = cv2.divide(gray, background, scale=128)
+    enhanced = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(flat)
+
+    # Creases are thin DARK valleys: black-hat keeps structures narrower than
+    # the kernel and discards everything broader.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    blackhat = cv2.morphologyEx(enhanced, cv2.MORPH_BLACKHAT, kernel)
+    blackhat = cv2.GaussianBlur(blackhat, (3, 3), 0)
+
+    # Otsu always splits an image in two, even one with no creases at all, so a
+    # smooth gradient would yield phantom "lines". Measured black-hat response:
+    # real palms threshold at 16-23 (99th pct 43-66), while a gradient lands at
+    # 1 and a heavily blurred frame at 2. A floor of 8 separates them.
+    otsu, _ = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, binary = cv2.threshold(blackhat, max(otsu, MIN_CREASE_RESPONSE), 255,
+                              cv2.THRESH_BINARY)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+
+    # Rank connected components by how long and elongated they are, so the
+    # principal lines win over speckle and skin pores.
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    lines = []
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA]
+        bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        span = float(np.hypot(bw, bh))
+        if area < 25 or span < min_length:
+            continue
+        mask = (labels == i).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        length = cv2.arcLength(contours[0], True) / 2.0 if contours else span
+        lines.append({"length": float(length), "span": span, "area": int(area),
+                      "mask": mask})
+    lines.sort(key=lambda d: d["length"], reverse=True)
+
+    # All creases, on black -- the matcher's eye view.
+    creases = np.zeros_like(work)
+    creases[binary > 0] = (34, 211, 238)
+
+    # Overlay: every crease faint, the principal lines bold and coloured.
+    overlay = work.copy()
+    tint = overlay.copy()
+    tint[binary > 0] = (34, 211, 238)
+    overlay = cv2.addWeighted(tint, 0.45, overlay, 0.55, 0)
+
+    for rank, line in enumerate(lines[:max_principal]):
+        colour = PRINCIPAL_LINE_COLOURS[rank % len(PRINCIPAL_LINE_COLOURS)]
+        thick = cv2.dilate(line["mask"],
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        overlay[thick > 0] = colour
+
+    return overlay, creases, lines
+
+
 def palm_roi_to_input(palm_bgr):
     """Palm crop -> 138x138 encoder input, with the creases emphasised.
 
