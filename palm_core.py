@@ -38,9 +38,16 @@ CAMERA_SETTINGS_PATH = os.path.join(BASE_DIR, 'data', 'camera_settings.json')
 TARGET_SIZE = (138, 138)      # encoder input size
 PALM_STORE_SIZE = (256, 256)  # full-palm image kept in the database
 PALM_MARGIN = 0.08            # breathing room around the detected hand
-# ROI side as a multiple of the inscribed-circle radius. 1.6 keeps the crease
-# region while staying inside the palm, away from fingers and wrist.
-PALM_ROI_RADIUS_FACTOR = 1.6
+# ROI side as a multiple of the inscribed-circle radius. Sizing from the palm's
+# own radius is what makes the crop scale-invariant; the factor decides how much
+# of the palm is kept. 1.6 held only an inscribed patch (~60% of the hand), so
+# the stored image was not a full palmprint. 2.6 spans the whole palm.
+PALM_ROI_RADIUS_FACTOR = 2.6
+# Fraction of the crop that must be hand. The crop is masked, so the remainder
+# is black padding; too little means the palm is cut off or not flat.
+MIN_PALM_COVERAGE = 0.55
+# How much redder than blue a pixel must be to count as skin (colour images).
+SKIN_RED_MARGIN = 10
 EMBEDDING_DIM = 512  # ResNet-18 trunk output, matching output/embeddings
 # Swept on the real enrolled palms (24 re-captures x 2 people, plus 1500
 # unenrolled strangers drawn from the dataset gallery):
@@ -67,9 +74,13 @@ MIN_PALM_DETAIL = 0.0012
 
 # Extraction methods. Embeddings are only comparable within the same method, so
 # the method a sample was enrolled with is recorded alongside it.
-METHOD_FULL_PALM = "full-palm"       # whole hand, background removed
+METHOD_FULL_PALM = "full-palm-v2"    # whole palmprint, background masked out
 METHOD_DATASET = "dataset-style"     # threshold + centroid crop (Kaggle TIFFs)
-METHOD_LEGACY_CROP = "webcam/photo"  # superseded centre-crop; not comparable
+# Superseded extractions. Their geometry differs, so their embeddings are not
+# comparable with current captures and must never take part in matching.
+METHOD_LEGACY_CROP = "webcam/photo"  # fixed centre crop
+METHOD_LEGACY_INSCRIBED = "full-palm"  # inscribed patch, only ~60% of the palm
+STALE_METHODS = (METHOD_LEGACY_CROP, METHOD_LEGACY_INSCRIBED)
 
 LEFT, RIGHT = "Left Hand", "Right Hand"
 REQUIRED_HANDS = (LEFT, RIGHT)  # a person must enroll both before they can log in
@@ -215,6 +226,12 @@ def detect_palm(bgr, mirrored=True):
     saturation = hsv[:, :, 1]
     if not is_greyscale(bgr):
         mask = cv2.bitwise_and(mask, (saturation >= 15).astype(np.uint8) * 255)
+        # Skin is reddish: measured on real palms the red channel runs 31-47
+        # above blue (95% of pixels clear +10), while a grey-blue office wall
+        # sits 4 BELOW. Without this, walls and paper pass as skin.
+        blue, _, red = cv2.split(bgr.astype(np.int16))
+        mask = cv2.bitwise_and(
+            mask, (red > blue + SKIN_RED_MARGIN).astype(np.uint8) * 255)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -264,22 +281,33 @@ def detect_palm(bgr, mirrored=True):
     if radius < 24:
         return False, "Palm too small - bring your hand closer", None, None, "Palm"
 
+    # Size the crop from the palm's own radius -- that is what makes the ROI
+    # scale-invariant -- but large enough to hold the WHOLE palmprint rather
+    # than an inscribed patch of it.
     side = int(radius * PALM_ROI_RADIUS_FACTOR)
-    # Shrink (never shift) if the square would leave the frame, so the ROI stays
-    # centred on the palm instead of sliding off-centre.
-    side = min(side, 2 * pcx, 2 * (w - pcx), 2 * pcy, 2 * (h - pcy))
-    if side < radius:
-        return False, "Centre your palm in the frame", None, None, "Palm"
 
+    # Everything outside the hand goes black, so enlarging the crop cannot let
+    # the wall or the person's face into the template. Padding keeps the square
+    # centred on the palm instead of sliding off-centre near a frame edge.
+    hand_only = cv2.bitwise_and(bgr, bgr, mask=hand_mask)
+    pad = side
+    padded = cv2.copyMakeBorder(hand_only, pad, pad, pad, pad,
+                                cv2.BORDER_CONSTANT, value=(0, 0, 0))
+    padded_mask = cv2.copyMakeBorder(hand_mask, pad, pad, pad, pad,
+                                     cv2.BORDER_CONSTANT, value=0)
     half = side // 2
-    palm_bgr = bgr[pcy - half:pcy + half, pcx - half:pcx + half]
+    x1, y1 = pcx + pad - half, pcy + pad - half
+    palm_bgr = padded[y1:y1 + side, x1:x1 + side]
+    crop_mask = padded_mask[y1:y1 + side, x1:x1 + side]
     if palm_bgr.size == 0 or min(palm_bgr.shape[:2]) < 30:
         return False, "Could not crop a usable palm region", None, None, "Palm"
 
-    coverage = float(np.count_nonzero(
-        hand_mask[pcy - half:pcy + half, pcx - half:pcx + half])) / (side * side)
-    if coverage < 0.90:
-        return False, "Open your palm flat towards the camera", None, None, "Palm"
+    # The crop must be mostly palm. Too little means the hand is cut off by the
+    # frame or is not presented flat.
+    coverage = float(np.count_nonzero(crop_mask)) / float(side * side)
+    if coverage < MIN_PALM_COVERAGE:
+        return (False, "Show your whole open palm, flat towards the camera",
+                None, None, "Palm")
 
     palm_store = cv2.resize(palm_bgr, PALM_STORE_SIZE, interpolation=cv2.INTER_AREA)
     roi_rgb = cv2.cvtColor(palm_store, cv2.COLOR_BGR2RGB)
@@ -288,7 +316,16 @@ def detect_palm(bgr, mirrored=True):
     # Identity lives in the crease pattern. A flat region -- a wall, a blurred
     # or badly lit frame -- has none, and enrolling it would store a template
     # that matches anything equally badly.
-    detail = float(cv2.Laplacian(roi_norm, cv2.CV_32F).var())
+    #
+    # Measure strictly INSIDE the silhouette: masking the background creates a
+    # hard black edge, and that edge alone is enough Laplacian energy to pass
+    # the gate, which let a plain wall through as a palm.
+    small_mask = cv2.resize(crop_mask, TARGET_SIZE, interpolation=cv2.INTER_NEAREST)
+    interior = cv2.erode(small_mask,
+                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    laplacian = cv2.Laplacian(roi_norm, cv2.CV_32F)
+    inside = laplacian[interior > 0]
+    detail = float(inside.var()) if inside.size > 100 else 0.0
     if detail < MIN_PALM_DETAIL:
         return (False, "Palm lines not visible - hold steady, improve lighting",
                 None, None, "Palm")
@@ -698,8 +735,8 @@ def load_templates():
 
 
 def is_stale_source(source):
-    """True for samples captured with the superseded centre-crop extraction."""
-    return source == METHOD_LEGACY_CROP
+    """True for samples captured with any superseded extraction geometry."""
+    return source in STALE_METHODS
 
 
 def enrollment_status(hands):
@@ -719,13 +756,16 @@ def list_persons():
     rows = conn.execute("""
         SELECT p.*,
                COUNT(s.id) AS sample_count,
-               SUM(CASE WHEN s.source = ? THEN 1 ELSE 0 END) AS stale_count,
-               SUM(CASE WHEN s.hand = ? AND s.source IS NOT ? THEN 1 ELSE 0 END) AS left_count,
-               SUM(CASE WHEN s.hand = ? AND s.source IS NOT ? THEN 1 ELSE 0 END) AS right_count
+               SUM(CASE WHEN s.source IN (%(stale)s) THEN 1 ELSE 0 END) AS stale_count,
+               SUM(CASE WHEN s.hand = ? AND s.source NOT IN (%(stale)s)
+                        THEN 1 ELSE 0 END) AS left_count,
+               SUM(CASE WHEN s.hand = ? AND s.source NOT IN (%(stale)s)
+                        THEN 1 ELSE 0 END) AS right_count
         FROM persons p LEFT JOIN samples s ON s.person_id = p.id
         GROUP BY p.id ORDER BY p.name
-    """, (METHOD_LEGACY_CROP, LEFT, METHOD_LEGACY_CROP,
-          RIGHT, METHOD_LEGACY_CROP)).fetchall()
+    """ % {"stale": ",".join("?" * len(STALE_METHODS))},
+        tuple(STALE_METHODS) + (LEFT,) + tuple(STALE_METHODS)
+        + (RIGHT,) + tuple(STALE_METHODS)).fetchall()
     conn.close()
 
     people = []
